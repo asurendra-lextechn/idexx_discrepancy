@@ -58,37 +58,30 @@ def get_sql_server_engine():
     engine = create_engine(connection_string, pool_pre_ping=True, pool_recycle=300)
     return engine 
 
-def get_workorder_value():
-    excel_file = "example_excel.xlsx"
-    df = pd.read_excel(excel_file, sheet_name='8.1')
-    vendor_bag_count = df['VENDOR BAG COUNT']
-    lab_bag_count = df['LAB BAG COUNT']
-
-    if vendor_bag_count < lab_bag_count:
-        workorderid = df['WORKORDER']
-        value = lab_bag_count
-        tuple_value = (workorderid, value)
-    return tuple_value
-
-
 def update_db(workorder_value):
     """Execute parameterized updates for a list of (workorderid, value)."""
     if not workorder_value:
+        logging.info("No workorders to update.")
         return
     engine = get_sql_server_engine()
     sql = text("""
-        UPDATE manifestlocationcolumnmappingvalue
+        UPDATE mlcmv
            SET VALUE = :value
-        FROM IdexxServiceBU i
-        JOIN manifestlocationmappings mlm ON i.manifestlocationmappingid = mlm.id
-        JOIN manifestlocationcolumnmappings mlcm ON mlcm.ManifestLocationMappingId = mlm.id
-        JOIN manifestlocationcolumnmappingvalue mlcmv ON mlcmv.manifestlocationcolumnmappingid = mlcm.manifestlocationcolumnmappingid
-       WHERE i.workorderid = :workorderid AND mlcm.ColumnId = 38
+          FROM IdexxService i
+          JOIN manifestlocationmappings mlm ON i.manifestlocationmappingid = mlm.id
+          JOIN manifestlocationcolumnmappings mlcm ON mlcm.ManifestLocationMappingId = mlm.id
+          JOIN manifestlocationcolumnmappingvalue mlcmv ON mlcmv.manifestlocationcolumnmappingid = mlcm.manifestlocationcolumnmappingid
+         WHERE i.workorderid = :workorderid AND mlcm.ColumnId = 38
     """)
     try:
         with engine.begin() as conn:
             for workorderid, value in workorder_value:
-                conn.execute(sql, {"workorderid": int(workorderid), "value": int(value)})
+                logging.info(f"Executing update for workorderid: {workorderid} with value: {value}")
+                result = conn.execute(sql, {"workorderid": int(workorderid), "value": int(value)})
+                if result.rowcount == 0:
+                    logging.warning(f"No rows updated for workorderid: {workorderid}. Check if it exists and meets query conditions.")
+                else:
+                    logging.info(f"{result.rowcount} row(s) updated for workorderid: {workorderid}.")
     except Exception:
         logging.error("DB update failed:\n%s", traceback.format_exc())
         raise
@@ -116,14 +109,20 @@ def send_email_with_attachment(smtp_server, smtp_port, sender, recipient, subjec
     part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
     msg.attach(part)
 
-    if username and password:
+    # Only attempt to send if a server other than localhost is specified, and we have credentials.
+    if smtp_server and smtp_server.lower() != 'localhost' and username and password:
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(smtp_server, smtp_port, context=context) as server:
-            server.login(username, password)
-            server.sendmail(sender, recipient, msg.as_string())
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls(context=context)  # Secure the connection
+                server.login(username, password)
+                server.sendmail(sender, recipient, msg.as_string())
+                print(f"Email sent successfully to {recipient}")
+        except Exception as e:
+            logging.error("Failed to send email: %s", e)
+            raise
     else:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.sendmail(sender, recipient, msg.as_string())
+        logging.warning("Skipping email: SMTP server/credentials not configured.")
 
 def process_latest_excel(file_path, email_recipient="asurendra@lextechn.com"):
     """
@@ -140,11 +139,11 @@ def process_latest_excel(file_path, email_recipient="asurendra@lextechn.com"):
     df = sheets[latest_sheet]
 
     # find columns (case-insensitive)
-    vendor_col = _find_column(df, "VENDOR BAG COUNT")
-    lab_col = _find_column(df, "LAB BAG COUNT")
-    workorder_col = _find_column(df, "WORKORDER")
+    vendor_col = _find_column(df, 'VENDOR BAG COUNT')
+    lab_col = _find_column(df, 'LAB BAG COUNT')
+    workorder_col = _find_column(df, 'WORKORDER ')
     notes_col = _find_column(df, "NOTES") or _find_column(df, "NOTE")
-
+    print(df.columns)
     if not (vendor_col and lab_col and workorder_col):
         raise ValueError("Required columns not found in sheet: VENDOR BAG COUNT, LAB BAG COUNT, WORKORDER")
 
@@ -154,6 +153,13 @@ def process_latest_excel(file_path, email_recipient="asurendra@lextechn.com"):
 
     # prepare workorder/value tuples
     workorder_values = []
+    if to_process.empty:
+        logging.info("No rows found in Excel that require processing.")
+    else:
+        logging.info(f"Found {len(to_process)} rows to process in Excel:")
+        for index, row in to_process.iterrows():
+            logging.info(f"  - Row {index}: WORKORDER={row[workorder_col]}, VENDOR BAG COUNT={row[vendor_col]}, LAB BAG COUNT={row[lab_col]}")
+
     for _, row in to_process.iterrows():
         w = row[workorder_col]
         v = row[lab_col]
@@ -184,9 +190,9 @@ def process_latest_excel(file_path, email_recipient="asurendra@lextechn.com"):
 
     # send email (SMTP config from env)
     smtp_server = os.getenv("SMTP_SERVER", "localhost")
-    smtp_port = int(os.getenv("SMTP_PORT", os.getenv("SMTP_PORT", 25)))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("EMAIL_SENDER")
+    smtp_pass = os.getenv("EMAIL_PASSWORD")
     sender = os.getenv("EMAIL_SENDER", "noreply@example.com")
     subject = "IDEXX Package count discrepancy"
     body = "All the VENDOR BAG COUNT< LAB BAG COUNT package counts are updated"
@@ -194,6 +200,10 @@ def process_latest_excel(file_path, email_recipient="asurendra@lextechn.com"):
     send_email_with_attachment(smtp_server, smtp_port, sender, email_recipient, subject, body, file_path, smtp_user, smtp_pass)
 
 if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    # Load environment variables from .env file at the start
+    load_dotenv()
     # quick run for local development
     example_file = os.path.join(os.path.dirname(__file__), "example_excel.xlsx")
     process_latest_excel(example_file)
