@@ -1,73 +1,54 @@
-import pyodbc
-import sys
 import os
 import pandas as pd
-import numpy as np
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from urllib.parse import quote_plus
-from datetime import date,datetime,timedelta
 import logging
 import traceback
+import smtplib
+import ssl
+import shutil
+import openpyxl # Import the openpyxl library
+from urllib.parse import quote_plus
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-import smtplib
-import ssl
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
-
-
-
-def connect_to_sql_server():
-    """Connect to SQL Server using pyodbc with explicit driver & port."""
-    load_dotenv()  
-    driver   = os.getenv('ODBC_DRIVER', 'ODBC Driver 17 for SQL Server')
-    server = os.getenv('server_name', 'localhost')
-    port     = os.getenv('SQL_PORT', '1433')
-    database = os.getenv('database_name')
-    uid      = os.getenv('DB_USER')
-    pwd      = os.getenv('DB_PASSWORD')
-
-    conn_str = (
-        f"Driver={{{driver}}};"
-        f"Server={server},{port};"
-        f"Database={database};"
-        f"UID={uid};"
-        f"PWD={pwd};"
-        "Encrypt=no;"
-        "TrustServerCertificate=yes;"
-        "Connection Timeout=30;"
-    )
-    return pyodbc.connect(conn_str)
+# --- Load Configuration and Define Paths ---
+load_dotenv()
+BASE_FOLDER = "IDEXX Discrepancy files"
+NEW_FOLDER = os.path.join(BASE_FOLDER, "New")
+COMPLETED_FOLDER = os.path.join(BASE_FOLDER, "Completed")
+ERROR_FOLDER = os.path.join(BASE_FOLDER, "Error")
 
 def get_sql_server_engine():
     """Create SQLAlchemy engine for SQL Server"""
-    load_dotenv()
-    server = os.getenv('server_name', 'localhost')
+    server = os.getenv('server_name', '10.120.17.99')
     database = os.getenv('database_name')
     username = os.getenv('DB_USER')
     password = os.getenv('DB_PASSWORD')
-    driver = os.getenv('ODBC_DRIVER', 'ODBC Driver 17 for SQL Server').replace(' ', '+')
+    driver = os.getenv('ODBC_DRIVER', 'ODBC Driver 17 for SQL Server')
     
-    # URL encode credentials
     username_encoded = quote_plus(username) if username else ""
     password_encoded = quote_plus(password) if password else ""
-    
     connection_string = f"mssql+pyodbc://{username_encoded}:{password_encoded}@{server}/{database}?driver={driver}&Encrypt=no&TrustServerCertificate=yes&timeout=30"
-    
     engine = create_engine(connection_string, pool_pre_ping=True, pool_recycle=300)
-    return engine 
+    return engine
 
 def update_db(workorder_value):
-    """Execute parameterized updates for a list of (workorderid, value)."""
+    """
+    Execute parameterized updates for a list of (workorderid, value).
+    Returns the total number of rows updated.
+    """
     if not workorder_value:
-        logging.info("No workorders to update.")
-        return
+        logging.info("No workorders to update in the database.")
+        return 0
+    
+    total_updated_rows = 0
     engine = get_sql_server_engine()
     sql = text("""
         UPDATE mlcmv
            SET VALUE = :value
-          FROM IdexxService i
+          FROM IdexxServiceBU i
           JOIN manifestlocationmappings mlm ON i.manifestlocationmappingid = mlm.id
           JOIN manifestlocationcolumnmappings mlcm ON mlcm.ManifestLocationMappingId = mlm.id
           JOIN manifestlocationcolumnmappingvalue mlcmv ON mlcmv.manifestlocationcolumnmappingid = mlcm.manifestlocationcolumnmappingid
@@ -79,12 +60,15 @@ def update_db(workorder_value):
                 logging.info(f"Executing update for workorderid: {workorderid} with value: {value}")
                 result = conn.execute(sql, {"workorderid": int(workorderid), "value": int(value)})
                 if result.rowcount == 0:
-                    logging.warning(f"No rows updated for workorderid: {workorderid}. Check if it exists and meets query conditions.")
+                    logging.warning(f"No rows updated for workorderid: {workorderid}. Check if it exists.")
                 else:
                     logging.info(f"{result.rowcount} row(s) updated for workorderid: {workorderid}.")
+                total_updated_rows += result.rowcount
     except Exception:
         logging.error("DB update failed:\n%s", traceback.format_exc())
         raise
+    
+    return total_updated_rows
 
 def _find_column(df, name):
     """Case-insensitive column lookup, returns first match or None."""
@@ -94,10 +78,8 @@ def _find_column(df, name):
             return c
     return None
 
-
-
 def send_email_with_attachment(smtp_server, smtp_port, sender, recipient, subject, body, attachment_path, username=None, password=None):
-    """Send email with the attachment. If username/password are not provided, attempts plaintext SMTP (localhost)."""
+    """Send email with the attachment."""
     msg = MIMEMultipart()
     msg["From"] = sender
     msg["To"] = recipient
@@ -109,101 +91,183 @@ def send_email_with_attachment(smtp_server, smtp_port, sender, recipient, subjec
     part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
     msg.attach(part)
 
-    # Only attempt to send if a server other than localhost is specified, and we have credentials.
     if smtp_server and smtp_server.lower() != 'localhost' and username and password:
         context = ssl.create_default_context()
         try:
             with smtplib.SMTP(smtp_server, smtp_port) as server:
-                server.starttls(context=context)  # Secure the connection
+                server.starttls(context=context)
                 server.login(username, password)
                 server.sendmail(sender, recipient, msg.as_string())
-                print(f"Email sent successfully to {recipient}")
+                logging.info(f"Email sent successfully to {recipient}")
         except Exception as e:
             logging.error("Failed to send email: %s", e)
             raise
     else:
         logging.warning("Skipping email: SMTP server/credentials not configured.")
 
-def process_latest_excel(file_path, email_recipient="asurendra@lextechn.com"):
+def process_excel_file(file_path):
     """
-    1. Reads the latest sheet from the Excel file.
-    2. Finds rows where VENDOR BAG COUNT < LAB BAG COUNT and NOTES != 'updated'.
-    3. Calls update_db on those workorders.
-    4. Marks NOTES='updated' on processed rows and writes back the Excel.
-    5. Emails the updated Excel to email_recipient.
+    Processes a single Excel file: reads it, updates the DB, updates the Excel file,
+    and sends a notification email with statistics.
     """
-    # load all sheets
-    xls = pd.ExcelFile(file_path)
-    latest_sheet = xls.sheet_names[-1]
-    sheets = pd.read_excel(file_path, sheet_name=None)  # dict of all sheets
-    df = sheets[latest_sheet]
+    logging.info(f"Processing file: {file_path}")
+    xls = None  # Define xls here to ensure it's accessible in the finally block
+    try:
+        xls = pd.ExcelFile(file_path)
+        latest_sheet_name = xls.sheet_names[-1]
 
-    # find columns (case-insensitive)
-    vendor_col = _find_column(df, 'VENDOR BAG COUNT')
-    lab_col = _find_column(df, 'LAB BAG COUNT')
-    workorder_col = _find_column(df, 'WORKORDER ')
-    notes_col = _find_column(df, "NOTES") or _find_column(df, "NOTE")
-    print(df.columns)
-    if not (vendor_col and lab_col and workorder_col):
-        raise ValueError("Required columns not found in sheet: VENDOR BAG COUNT, LAB BAG COUNT, WORKORDER")
+        # --- Dynamic Header Finding Logic ---
+        # Read the latest sheet without a header to find the real one
+        df_temp = pd.read_excel(xls, sheet_name=latest_sheet_name, header=None)
+        header_row_index = -1
+        # Search for the header row in the first 10 rows of the sheet
+        for i in range(min(10, len(df_temp))):
+            # Check if the essential columns exist in this row (case-insensitive)
+            row_values = [str(v).lower().strip() for v in df_temp.iloc[i].values]
+            if "vendor bag count" in row_values and "lab bag count" in row_values and "workorder" in row_values:
+                header_row_index = i
+                break
 
-    notes_series = df[notes_col].fillna("") if notes_col else pd.Series([""] * len(df), index=df.index)
-    mask = (df[vendor_col].astype(float) < df[lab_col].astype(float)) & (notes_series.str.lower() != "updated")
-    to_process = df.loc[mask]
+        if header_row_index == -1:
+            logging.error(f"Could not find header row in sheet '{latest_sheet_name}'. Searched first 10 rows.")
+            raise ValueError("Required columns not found in sheet: VENDOR BAG COUNT, LAB BAG COUNT, WORKORDER")
 
-    # prepare workorder/value tuples
-    workorder_values = []
-    if to_process.empty:
-        logging.info("No rows found in Excel that require processing.")
-    else:
-        logging.info(f"Found {len(to_process)} rows to process in Excel:")
-        for index, row in to_process.iterrows():
-            logging.info(f"  - Row {index}: WORKORDER={row[workorder_col]}, VENDOR BAG COUNT={row[vendor_col]}, LAB BAG COUNT={row[lab_col]}")
+        logging.info(f"Dynamically found header for sheet '{latest_sheet_name}' at row index {header_row_index}.")
 
-    for _, row in to_process.iterrows():
-        w = row[workorder_col]
-        v = row[lab_col]
-        try:
-            workorder_values.append((int(w), int(v)))
-        except Exception:
-            logging.warning("Skipping row with non-integer workorder/value: %s / %s", w, v)
+        # --- Read all sheets, applying the found header only to the latest one ---
+        sheets = {}
+        for sheet_name in xls.sheet_names:
+            header_to_use = header_row_index if sheet_name == latest_sheet_name else 0
+            sheets[sheet_name] = pd.read_excel(xls, sheet_name=sheet_name, header=header_to_use)
 
-    # update DB
-    if workorder_values:
-        update_db(workorder_values)
+        df = sheets[latest_sheet_name]
 
-        # mark updated in dataframe
-        if notes_col:
-            df.loc[mask, notes_col] = "updated"
+        # --- Clean column names by stripping leading/trailing whitespace ---
+        df.columns = df.columns.str.strip()
+
+        logging.info(f"Columns successfully read and cleaned: {df.columns.tolist()}")
+
+        vendor_col = _find_column(df, "VENDOR BAG COUNT")
+        lab_col = _find_column(df, "LAB BAG COUNT")
+        workorder_col = _find_column(df, "WORKORDER")
+        notes_col = _find_column(df, "NOTES") or _find_column(df, "NOTE")
+
+        if not (vendor_col and lab_col and workorder_col):
+            raise ValueError("Required columns not found in sheet: VENDOR BAG COUNT, LAB BAG COUNT, WORKORDER")
+
+        # --- Calculate Statistics ---
+        total_workorders = df[workorder_col].dropna().count()
+
+        notes_series = df[notes_col].fillna("") if notes_col else pd.Series([""] * len(df), index=df.index)
+        # Ensure numeric columns are treated as numbers, coercing errors to NaN
+        df[vendor_col] = pd.to_numeric(df[vendor_col], errors='coerce')
+        df[lab_col] = pd.to_numeric(df[lab_col], errors='coerce')
+
+        mask = (df[vendor_col] < df[lab_col]) & (notes_series.str.lower() != "updated")
+        to_process = df.loc[mask]
+        
+        discrepancy_count = len(to_process)
+        successful_updates = 0
+
+        workorder_values = []
+        if to_process.empty:
+            logging.info("No rows found in Excel that require processing.")
         else:
-            # create NOTES column if missing
-            df["NOTES"] = ""
-            df.loc[mask, "NOTES"] = "updated"
-            sheets[latest_sheet] = df
+            logging.info(f"Found {len(to_process)} rows to process in Excel.")
+            for _, row in to_process.iterrows():
+                w = row[workorder_col]
+                v = row[lab_col]
+                try:
+                    workorder_values.append((int(w), int(v)))
+                except (ValueError, TypeError):
+                    logging.warning(f"Skipping row with non-integer workorder/value: {w} / {v}")
 
-        # write back all sheets (preserve others)
-        with pd.ExcelWriter(file_path, engine="openpyxl", mode="w") as writer:
-            for name, sheet_df in sheets.items():
-                if name == latest_sheet:
-                    sheet_df = df
-                sheet_df.to_excel(writer, sheet_name=name, index=False)
+        if workorder_values:
+            successful_updates = update_db(workorder_values)
+            if notes_col:
+                df.loc[mask, notes_col] = "UPDATED"
+            else:
+                df["NOTES"] = ""
+                df.loc[mask, "NOTES"] = "UPDATED"
+            sheets[latest_sheet_name] = df
 
-    # send email (SMTP config from env)
-    smtp_server = os.getenv("SMTP_SERVER", "localhost")
-    smtp_port = int(os.getenv("SMTP_PORT", 587))
-    smtp_user = os.getenv("EMAIL_SENDER")
-    smtp_pass = os.getenv("EMAIL_PASSWORD")
-    sender = os.getenv("EMAIL_SENDER", "noreply@example.com")
-    subject = "IDEXX Package count discrepancy"
-    body = "All the VENDOR BAG COUNT< LAB BAG COUNT package counts are updated"
+            # Explicitly close the reader before writing
+            xls.close()
+            xls = None
 
-    send_email_with_attachment(smtp_server, smtp_port, sender, email_recipient, subject, body, file_path, smtp_user, smtp_pass)
+            with pd.ExcelWriter(file_path, engine="openpyxl", mode="w") as writer:
+                for name, sheet_df in sheets.items():
+                    sheet_df.to_excel(writer, sheet_name=name, index=False)
+            logging.info(f"Successfully updated Excel file: {file_path}")
+
+            # --- Set the last sheet as the active sheet ---
+            try:
+                workbook = openpyxl.load_workbook(file_path)
+                # Set the active sheet to the last one in the workbook
+                workbook.active = len(workbook.sheetnames) - 1
+                workbook.save(file_path)
+                logging.info(f"Set active sheet to '{latest_sheet_name}'.")
+            except Exception as e:
+                # This is a non-critical step, so we just log a warning if it fails
+                logging.warning(f"Could not set active sheet. Error: {e}")
+
+        smtp_server = os.getenv("SMTP_SERVER")
+        smtp_port = int(os.getenv("SMTP_PORT", 587))
+        smtp_user = os.getenv("EMAIL_SENDER")
+        smtp_pass = os.getenv("EMAIL_PASSWORD")
+        sender = os.getenv("EMAIL_SENDER", "noreply@example.com")
+        email_recipient = os.getenv("EMAIL_RECIPIENT")
+        
+        # --- Create Dynamic Email Subject and Body ---
+        subject = f"IDEXX Discrepancy Report Processed: {os.path.basename(file_path)}"
+        body = f"""
+Processing summary for file: {os.path.basename(file_path)}
+
+- Total Workorders in Sheet: {total_workorders}
+- Workorders with Discrepancy (Vendor < Lab): {discrepancy_count}
+- Successfully Updated in Database: {successful_updates}
+
+This is an automated report.
+"""
+
+        send_email_with_attachment(smtp_server, smtp_port, sender, email_recipient, subject, body, file_path, smtp_user, smtp_pass)
+    finally:
+        # This block ensures the Excel file handle is closed even if errors occur
+        if xls:
+            xls.close()
+            logging.info("Excel file handle closed.")
+
+def main_workflow():
+    """
+    Main orchestration function. Finds new files, processes them, and moves them.
+    """
+    # Ensure all necessary folders exist
+    for folder in [NEW_FOLDER, COMPLETED_FOLDER, ERROR_FOLDER]:
+        os.makedirs(folder, exist_ok=True)
+
+    logging.info("Starting workflow. Looking for new files...")
+    files_to_process = [f for f in os.listdir(NEW_FOLDER) if f.endswith(('.xlsx', '.xls'))]
+
+    if not files_to_process:
+        logging.info("No new files to process.")
+        return
+
+    for filename in files_to_process:
+        source_path = os.path.join(NEW_FOLDER, filename)
+        try:
+            process_excel_file(source_path)
+            # If successful, move to 'Completed' folder
+            destination_path = os.path.join(COMPLETED_FOLDER, filename)
+            shutil.move(source_path, destination_path)
+            logging.info(f"Successfully processed and moved '{filename}' to Completed folder.")
+        except Exception as e:
+            logging.error(f"Failed to process file '{filename}': {e}")
+            traceback.print_exc()
+            # If failed, move to 'Error' folder
+            destination_path = os.path.join(ERROR_FOLDER, filename)
+            shutil.move(source_path, destination_path)
+            logging.warning(f"Moved failed file '{filename}' to Error folder.")
 
 if __name__ == "__main__":
-    # Configure logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    # Load environment variables from .env file at the start
-    load_dotenv()
-    # quick run for local development
-    example_file = os.path.join(os.path.dirname(__file__), "example_excel.xlsx")
-    process_latest_excel(example_file)
+    main_workflow()
