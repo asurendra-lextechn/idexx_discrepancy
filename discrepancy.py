@@ -5,13 +5,17 @@ import traceback
 import smtplib
 import ssl
 import shutil
-import openpyxl # Import the openpyxl library
+import openpyxl
 from urllib.parse import quote_plus
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+# Import the download function from the other script
+import download_excel
+
 
 # --- Load Configuration and Define Paths ---
 load_dotenv()
@@ -37,18 +41,18 @@ def get_sql_server_engine():
 def update_db(workorder_value):
     """
     Execute parameterized updates for a list of (workorderid, value).
-    Returns the total number of rows updated.
+    Returns a list of workorder IDs that were successfully updated.
     """
     if not workorder_value:
         logging.info("No workorders to update in the database.")
-        return 0
+        return []
     
-    total_updated_rows = 0
+    successfully_updated_ids = []
     engine = get_sql_server_engine()
     sql = text("""
         UPDATE mlcmv
-           SET VALUE = :value
-          FROM IdexxServiceBU i
+           SET VALUE = :value, UpdatedOn = GETDATE(), UpdatedBy = '13F6B7B1-A934-4019-B97C-2FBC493CFDF3'
+          FROM IdexxService i
           JOIN manifestlocationmappings mlm ON i.manifestlocationmappingid = mlm.id
           JOIN manifestlocationcolumnmappings mlcm ON mlcm.ManifestLocationMappingId = mlm.id
           JOIN manifestlocationcolumnmappingvalue mlcmv ON mlcmv.manifestlocationcolumnmappingid = mlcm.manifestlocationcolumnmappingid
@@ -59,16 +63,16 @@ def update_db(workorder_value):
             for workorderid, value in workorder_value:
                 logging.info(f"Executing update for workorderid: {workorderid} with value: {value}")
                 result = conn.execute(sql, {"workorderid": int(workorderid), "value": int(value)})
-                if result.rowcount == 0:
-                    logging.warning(f"No rows updated for workorderid: {workorderid}. Check if it exists.")
-                else:
+                if result.rowcount > 0:
                     logging.info(f"{result.rowcount} row(s) updated for workorderid: {workorderid}.")
-                total_updated_rows += result.rowcount
+                    successfully_updated_ids.append(workorderid)
+                else:
+                    logging.warning(f"No rows updated for workorderid: {workorderid}. Check if it exists.")
     except Exception:
         logging.error("DB update failed:\n%s", traceback.format_exc())
         raise
     
-    return total_updated_rows
+    return successfully_updated_ids
 
 def _find_column(df, name):
     """Case-insensitive column lookup, returns first match or None."""
@@ -84,7 +88,7 @@ def send_email_with_attachment(smtp_server, smtp_port, sender, recipient, subjec
     msg["From"] = sender
     msg["To"] = recipient
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(body, "html"))
 
     with open(attachment_path, "rb") as f:
         part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
@@ -167,7 +171,7 @@ def process_excel_file(file_path):
         to_process = df.loc[mask]
         
         discrepancy_count = len(to_process)
-        successful_updates = 0
+        successful_updates_count = 0
 
         workorder_values = []
         if to_process.empty:
@@ -183,13 +187,22 @@ def process_excel_file(file_path):
                     logging.warning(f"Skipping row with non-integer workorder/value: {w} / {v}")
 
         if workorder_values:
-            successful_updates = update_db(workorder_values)
-            if notes_col:
-                df.loc[mask, notes_col] = "UPDATED"
+            successfully_updated_ids = update_db(workorder_values)
+            successful_updates_count = len(successfully_updated_ids)
+
+            if successfully_updated_ids:
+                # Create a new mask to update only the rows that were successful in the DB
+                success_mask = df[workorder_col].isin(successfully_updated_ids)
+                
+                if notes_col:
+                    df.loc[success_mask, notes_col] = "UPDATED"
+                else:
+                    df["NOTES"] = ""
+                    df.loc[success_mask, "NOTES"] = "UPDATED"
+                sheets[latest_sheet_name] = df
             else:
-                df["NOTES"] = ""
-                df.loc[mask, "NOTES"] = "UPDATED"
-            sheets[latest_sheet_name] = df
+                logging.warning("No database rows were updated, so the Excel file will not be modified.")
+
 
             # Explicitly close the reader before writing
             xls.close()
@@ -219,16 +232,21 @@ def process_excel_file(file_path):
         email_recipient = os.getenv("EMAIL_RECIPIENT")
         
         # --- Create Dynamic Email Subject and Body ---
-        subject = f"IDEXX Discrepancy Report Processed: {os.path.basename(file_path)}"
-        body = f"""
-Processing summary for file: {os.path.basename(file_path)}
-
-- Total Workorders in Sheet: {total_workorders}
-- Workorders with Discrepancy (Vendor < Lab): {discrepancy_count}
-- Successfully Updated in Database: {successful_updates}
-
-This is an automated report.
-"""
+        # Remove .xlsx or .xls extension from file name for subject
+        base_filename = os.path.splitext(os.path.basename(file_path))[0]
+        subject = f"IDEXX Discrepancy Report Processed: {base_filename} {latest_sheet_name}"
+        body = (
+            f"<html><body>"
+            f"<h2>Automatic Discrepancy Update Report</h2>"
+            f"<ul>"
+            f"<li>Total Workorders in Sheet: {total_workorders}</li>"
+            f"<li>Workorders with Discrepancy (Vendor &lt; Lab): {discrepancy_count}</li>"
+            f"<li>Successfully Updated in Database: {successful_updates_count}</li>"
+            f"<li><b>Remaining Discrepancies (not updated): {total_workorders - successful_updates_count}</b></li>"
+            f"</ul>"
+            f"<p>This is an automated report.</p>"
+            f"</body></html>"
+        )
 
         send_email_with_attachment(smtp_server, smtp_port, sender, email_recipient, subject, body, file_path, smtp_user, smtp_pass)
     finally:
@@ -237,7 +255,7 @@ This is an automated report.
             xls.close()
             logging.info("Excel file handle closed.")
 
-def main_workflow():
+def process_new_files():
     """
     Main orchestration function. Finds new files, processes them, and moves them.
     """
@@ -270,4 +288,24 @@ def main_workflow():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    main_workflow()
+    logging.info("--- Starting Automated Workflow ---")
+    
+    # Step 1: Download new files from email
+    logging.info("Step 1: Checking for new emails and downloading attachments...")
+    try:
+        download_status = download_excel.download_attachments()
+        
+        # Step 2: Process downloaded files only if the download was successful
+        if download_status == 1:
+            logging.info("Download successful. Proceeding to process files.")
+            process_new_files()
+        else:
+            logging.info("No new files were downloaded. Checking for existing files to process...")
+            # Still process any files that might be in the 'New' folder from a previous failed run
+            process_new_files()
+            
+    except Exception as e:
+        logging.error("A critical error occurred in the download step: %s", e)
+        traceback.print_exc()
+
+    logging.info("--- Workflow Finished ---")

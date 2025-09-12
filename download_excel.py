@@ -40,17 +40,17 @@ def generate_auth_string(user, token):
 
 def download_attachments():
     """
-    Connects to the mailbox, finds emails with 'discrepancy' in the subject,
-    downloads attachments to the 'New' folder, and marks emails as read.
+    Connects to the mailbox, downloads attachments from relevant emails,
+    and returns 1 if files were downloaded, 0 otherwise.
     """
     if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET, IMAP_USER]):
         print("Error: Ensure TENANT_ID, CLIENT_ID, CLIENT_SECRET, and IMAP_USER are in your .env file.")
-        return
+        return 0
 
-    # Create the 'New' directory if it doesn't exist
     os.makedirs(NEW_FOLDER, exist_ok=True)
-
     mail = None
+    overall_download_status = False  # Flag to track if any file is downloaded
+
     try:
         token_object = get_access_token()
         access_token = token_object['access_token']
@@ -63,33 +63,28 @@ def download_attachments():
         print("Successfully authenticated with the mailbox.")
 
         mail.select("INBOX")
-        # Search for all unread emails to filter them client-side
         status, messages = mail.search(None, '(UNSEEN)')
         if status != "OK":
             print("Error searching for messages.")
-            return
+            return 0
 
         message_ids = messages[0].split()
         print(f"Found {len(message_ids)} unread messages. Now filtering by subject...")
 
         for msg_id in message_ids:
-            # Fetch only the email header to check the subject
             status, msg_data = mail.fetch(msg_id, "(BODY[HEADER.FIELDS (SUBJECT)])")
             if status != "OK": continue
 
             subject_header = msg_data[0][1].decode('utf-8')
             subject = email.header.make_header(email.header.decode_header(subject_header.replace('Subject: ', ''))).__str__()
 
-            # Case-insensitive check for 'discrepancy' or 'discrepancies'
             if any(word in subject.lower() for word in ['discrepancy', 'discrepancies']):
                 print(f"  - Match found: Subject '{subject}'. Processing message ID {msg_id.decode()}.")
-
-                # Now fetch the full email to get attachments
                 status, full_msg_data = mail.fetch(msg_id, "(RFC822)")
                 if status != "OK": continue
 
                 msg = email.message_from_bytes(full_msg_data[0][1])
-                downloaded_something = False
+                downloaded_something_from_this_email = False
                 for part in msg.walk():
                     if "attachment" in str(part.get("Content-Disposition", "")):
                         filename = part.get_filename()
@@ -99,20 +94,17 @@ def download_attachments():
                             with open(filepath, "wb") as f:
                                 f.write(part.get_payload(decode=True))
                             print(f"    - Saved to: {filepath}")
-                            downloaded_something = True
+                            downloaded_something_from_this_email = True
+                            overall_download_status = True # A file was downloaded
 
-                # Mark email as read ONLY if we successfully downloaded an attachment
-                if downloaded_something:
+                if downloaded_something_from_this_email:
                     mail.store(msg_id, '+FLAGS', '\\Seen')
                     print(f"    - Marked message ID {msg_id.decode()} as read.")
-            else:
-                # If subject doesn't match, we can optionally mark it as read to ignore next time
-                # mail.store(msg_id, '+FLAGS', '\\Seen')
-                pass
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred during download: {e}")
         traceback.print_exc()
+        return 0 # Return 0 on error
     finally:
         if mail:
             if mail.state == 'SELECTED':
@@ -121,6 +113,8 @@ def download_attachments():
             print("Connection closed.")
 
     print("Email download process finished.")
+    return 1 if overall_download_status else 0
 
 if __name__ == "__main__":
+    # This allows the script to be run standalone for testing
     download_attachments()
